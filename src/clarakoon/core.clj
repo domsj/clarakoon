@@ -21,43 +21,44 @@
             HeapChannelBufferFactory
             ChannelBuffers]
            ))
-; (require '[clojure.core.async :as async :refer [<! >! <!! >!! timeout chan alt! go]])
+
+(require '[clojure.core.async :as async :refer [<! >! <!! >!! timeout chan alt! go]])
 
 (defn new-buffer []
   (ChannelBuffers/dynamicBuffer ByteOrder/LITTLE_ENDIAN 256))
 
 (def c (chan))
 
-(def result)
+(defn buf-read-string [buf]
+  (let [length (.readInt buf)
+        value (.toString (.readSlice buf length) (Charset/forName "UTF-8"))]
+    value))
+
+(defn buf-read-option [buf read-value]
+  (let [none-or-some-byte (.readByte buf)
+        result            (case none-or-some-byte
+                            0x00 '(:none)
+                            0x01 '(:some (read-value buf)))]))
+
+(defn buf-read-string-option [buf]
+  (buf-read-option buf buf-read-string))
 
 (defn client-handler [cluster-id decode-as]
   (proxy [ReplayingDecoder] []
     (channelConnected [^ChannelHandlerContext ctx e]
       (.write
        (.getChannel ctx)
-                                        ; write prologue
-       (doto (new-buffer)
+       (doto (new-buffer)               ; write prologue
          (.writeInt 0xb1ff0000)         ; magic
          (.writeInt 1)                  ; version
          (.writeInt (.length cluster-id))
          (.writeBytes (.getBytes cluster-id)))))
     (decode [ctx channel buf state]
       (let [return-code (.readInt buf)]
-        (def result '(return-code "fsd"))
         (case return-code
           0 (case @decode-as
               :who-master
-               (let [none-or-some-byte (.readByte buf)
-                     none-or-some (case none-or-some-byte
-                                    0x00 :none
-                                    0x01 :some)]
-                 (def result
-                   (case none-or-some
-                     :none '(:none)
-                     :some (let [length (.readInt buf)
-                                 master (.toString (.readSlice buf length) (Charset/forName "UTF-8"))]
-                             (list :some master))))))
-          )))))
+              (buf-read-string-option)))))))
 ;    #_(exceptionCaught [ctx cause]
 ;        (.close ctx)))
 
