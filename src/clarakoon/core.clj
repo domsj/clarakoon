@@ -39,11 +39,22 @@
                             0x01 (list :some (read-value buf)))]
     result))
 
+(defn buf-read-bool [buf]
+  (case (.readByte buf)
+    0x00 false
+    0x01 true))
+
+(defn buf-read-unit [buf]
+  :unit)
+
 (defn buf-read-string-option [buf]
   (buf-read-option buf buf-read-string))
 
 (defn buf-write-int [buf i]
   (.writeInt buf i))
+
+(defn buf-write-bool [buf value]
+  (.writeByte buf (if value 1 0)))
 
 (defn buf-write-string [buf ^String s]
   (buf-write-int buf (.length s))
@@ -89,9 +100,23 @@
 (defn set-decode [decode-with decoder]
   (swap! decode-with (fn [_] decoder)))
 
-(defn send-who-master [channel decode-with]
+(defn who-master [channel decode-with]
   (set-decode decode-with buf-read-string-option)
   (.write channel (command 2)))
+
+(defn set [channel decode-with key value]
+  (set-decode decode-with buf-read-unit)
+  (let [buf (command 9)]
+    (buf-write-string buf key)
+    (buf-write-string buf key)
+    (.write channel buf)))
+
+(defn exists [channel decode-with key]
+  (set-decode decode-with buf-read-bool)
+  (let [buf (command 7)]
+    (buf-write-bool buf false)
+    (buf-write-string buf key)
+    (.write channel buf)))
 
 (defn -main [& args]
   (let [decode-with (atom nil)
@@ -101,6 +126,10 @@
         future (.connect bootstrap (InetSocketAddress. "localhost" 4000))
         channel (.getChannel (.sync future))]
     (<!! connected)
+    (exists channel decode-with "key")
+    (println (<!! result-channel))
+    (set channel decode-with "key" "value")
+    (println (<!! result-channel))
     (send-who-master channel decode-with)
     (println (<!! result-channel))
     #_(.awaitUninterruptibly (.getCloseFuture channel))
