@@ -27,8 +27,6 @@
 (defn new-buffer []
   (ChannelBuffers/dynamicBuffer ByteOrder/LITTLE_ENDIAN 256))
 
-(def c (chan))
-
 (defn buf-read-string [buf]
   (let [length (.readInt buf)
         value (.toString (.readSlice buf length) (Charset/forName "UTF-8"))]
@@ -44,33 +42,34 @@
 (defn buf-read-string-option [buf]
   (buf-read-option buf buf-read-string))
 
-(def resultfds nil)
+(defn buf-write-int [buf i]
+  (.writeInt buf i))
 
-(defn client-handler [cluster-id decode-as connected result-channel]
+(defn buf-write-string [buf ^String s]
+  (buf-write-int buf (.length s))
+  (.writeBytes buf (.getBytes s)))
+
+(defn client-handler [cluster-id decode-with connected result-channel]
   (proxy [ReplayingDecoder] []
     (channelConnected [^ChannelHandlerContext ctx e]
       (.write
        (.getChannel ctx)
        (doto (new-buffer)               ; write prologue
-         (.writeInt 0xb1ff0000)         ; magic
-         (.writeInt 1)                  ; version
-         (.writeInt (.length cluster-id))
-         (.writeBytes (.getBytes cluster-id))))
+         (buf-write-int 0xb1ff0000)     ; magic
+         (buf-write-int 1)              ; version
+         (buf-write-string cluster-id)))
       (>!! connected 0))
     (decode [ctx channel buf state]
-      (def resultfds 89)
       (let [return-code (.readInt buf)]
         (case return-code
           0
-          (let [result (case @decode-as
-                         :who-master
-                         (buf-read-string-option buf))]
-            (>!! result-channel result)
-            result))))))
+          (do
+            (>!! result-channel (@decode-with buf))
+            0))))))
 ;    #_(exceptionCaught [ctx cause]
 ;        (.close ctx)))
 
-(defn bootstrap [cluster-id decode-as connected result-channel]
+(defn bootstrap [cluster-id decode-with connected result-channel]
   (doto
       (ClientBootstrap.
        (NioClientSocketChannelFactory.
@@ -81,27 +80,28 @@
      (proxy [ChannelPipelineFactory] []
        (getPipeline []
          (doto (Channels/pipeline)
-           (.addLast "handler" (client-handler cluster-id decode-as connected result-channel))))))))
+           (.addLast "handler" (client-handler cluster-id decode-with connected result-channel))))))))
 
 (defn command [code]
   (doto (new-buffer)
     (.writeInt (+ 0xb1ff0000 code))))
 
-(defn send-who-master [channel decode-as]
-  (swap! decode-as (fn [old] :who-master))
+(defn set-decode [decode-with decoder]
+  (swap! decode-with (fn [_] decoder)))
+
+(defn send-who-master [channel decode-with]
+  (set-decode decode-with buf-read-string-option)
   (.write channel (command 2)))
 
 (defn -main [& args]
-  (let [decode-as (atom :who-master)
+  (let [decode-with (atom nil)
         result-channel (chan)
         connected (chan)
-        bootstrap (bootstrap "ricky" decode-as connected result-channel)
+        bootstrap (bootstrap "ricky" decode-with connected result-channel)
         future (.connect bootstrap (InetSocketAddress. "localhost" 4000))
         channel (.getChannel (.sync future))]
     (<!! connected)
-    (send-who-master channel decode-as)
-    (println "taking...")
+    (send-who-master channel decode-with)
     (println (<!! result-channel))
-    (println "took...")
     #_(.awaitUninterruptibly (.getCloseFuture channel))
     (.releaseExternalResources bootstrap)))
