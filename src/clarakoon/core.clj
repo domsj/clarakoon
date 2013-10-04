@@ -46,7 +46,7 @@
 
 (def resultfds nil)
 
-(defn client-handler [cluster-id decode-as result-channel]
+(defn client-handler [cluster-id decode-as connected result-channel]
   (proxy [ReplayingDecoder] []
     (channelConnected [^ChannelHandlerContext ctx e]
       (.write
@@ -55,8 +55,8 @@
          (.writeInt 0xb1ff0000)         ; magic
          (.writeInt 1)                  ; version
          (.writeInt (.length cluster-id))
-         (.writeBytes (.getBytes cluster-id))
-         (.writeInt 0xb1ff0002))))
+         (.writeBytes (.getBytes cluster-id))))
+      (>!! connected 0))
     (decode [ctx channel buf state]
       (def resultfds 89)
       (let [return-code (.readInt buf)]
@@ -70,7 +70,7 @@
 ;    #_(exceptionCaught [ctx cause]
 ;        (.close ctx)))
 
-(defn bootstrap [cluster-id decode-as result-channel]
+(defn bootstrap [cluster-id decode-as connected result-channel]
   (doto
       (ClientBootstrap.
        (NioClientSocketChannelFactory.
@@ -81,7 +81,7 @@
      (proxy [ChannelPipelineFactory] []
        (getPipeline []
          (doto (Channels/pipeline)
-           (.addLast "handler" (client-handler cluster-id decode-as result-channel))))))))
+           (.addLast "handler" (client-handler cluster-id decode-as connected result-channel))))))))
 
 (defn command [code]
   (doto (new-buffer)
@@ -94,10 +94,12 @@
 (defn -main [& args]
   (let [decode-as (atom :who-master)
         result-channel (chan)
-        bootstrap (bootstrap "ricky" decode-as result-channel)
+        connected (chan)
+        bootstrap (bootstrap "ricky" decode-as connected result-channel)
         future (.connect bootstrap (InetSocketAddress. "localhost" 4000))
         channel (.getChannel (.sync future))]
-    #_(send-who-master channel decode-as)
+    (<!! connected)
+    (send-who-master channel decode-as)
     (println "taking...")
     (println (<!! result-channel))
     (println "took...")
