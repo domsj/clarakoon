@@ -37,13 +37,16 @@
 (defn buf-read-option [buf read-value]
   (let [none-or-some-byte (.readByte buf)
         result            (case none-or-some-byte
-                            0x00 '(:none)
-                            0x01 '(:some (read-value buf)))]))
+                            0x00 (list :none)
+                            0x01 (list :some (read-value buf)))]
+    result))
 
 (defn buf-read-string-option [buf]
   (buf-read-option buf buf-read-string))
 
-(defn client-handler [cluster-id decode-as]
+(def resultfds nil)
+
+(defn client-handler [cluster-id decode-as result-channel]
   (proxy [ReplayingDecoder] []
     (channelConnected [^ChannelHandlerContext ctx e]
       (.write
@@ -52,17 +55,22 @@
          (.writeInt 0xb1ff0000)         ; magic
          (.writeInt 1)                  ; version
          (.writeInt (.length cluster-id))
-         (.writeBytes (.getBytes cluster-id)))))
+         (.writeBytes (.getBytes cluster-id))
+         (.writeInt 0xb1ff0002))))
     (decode [ctx channel buf state]
+      (def resultfds 89)
       (let [return-code (.readInt buf)]
         (case return-code
-          0 (case @decode-as
-              :who-master
-              (buf-read-string-option)))))))
+          0
+          (let [result (case @decode-as
+                         :who-master
+                         (buf-read-string-option buf))]
+            (>!! result-channel result)
+            result))))))
 ;    #_(exceptionCaught [ctx cause]
 ;        (.close ctx)))
 
-(defn bootstrap [cluster-id decode-as]
+(defn bootstrap [cluster-id decode-as result-channel]
   (doto
       (ClientBootstrap.
        (NioClientSocketChannelFactory.
@@ -73,7 +81,7 @@
      (proxy [ChannelPipelineFactory] []
        (getPipeline []
          (doto (Channels/pipeline)
-           (.addLast "handler" (client-handler cluster-id decode-as))))))))
+           (.addLast "handler" (client-handler cluster-id decode-as result-channel))))))))
 
 (defn command [code]
   (doto (new-buffer)
@@ -84,10 +92,14 @@
   (.write channel (command 2)))
 
 (defn -main [& args]
-  (let [decode-as (atom nil)
-        bootstrap (bootstrap "ricky" decode-as)
+  (let [decode-as (atom :who-master)
+        result-channel (chan)
+        bootstrap (bootstrap "ricky" decode-as result-channel)
         future (.connect bootstrap (InetSocketAddress. "localhost" 4000))
         channel (.getChannel (.sync future))]
-    (send-who-master channel decode-as)
-    (.awaitUninterruptibly (.getCloseFuture channel))
+    #_(send-who-master channel decode-as)
+    (println "taking...")
+    (println (<!! result-channel))
+    (println "took...")
+    #_(.awaitUninterruptibly (.getCloseFuture channel))
     (.releaseExternalResources bootstrap)))
