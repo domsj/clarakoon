@@ -69,6 +69,7 @@
 
 ; TODOS
 ; - handle exceptions while decoding answers? exceptions and async? -> test, play
+; - handle sequences
 ; - handle other arakoon calls
 ; - write some integration tests, based on core/-main
 ; - make 'cluster'-client a la what's available in python client
@@ -79,7 +80,11 @@
     (println (<!! (:result-channel client)))
     (c/send-command client :exists false "key")
     (println (<!! (:result-channel client)))
-    (c/send-command client :set "key" "value")
+    (c/send-command client :set "key" "thevalue")
+    (println (<!! (:result-channel client)))
+    (c/send-command client :get false "key")
+    (println (<!! (:result-channel client)))
+    (c/send-command client :delete "key")
     (println (<!! (:result-channel client)))
     #_(.awaitUninterruptibly (.getCloseFuture channel))
     #_(.releaseExternalResources bootstrap)))
