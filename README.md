@@ -1,35 +1,8 @@
 # clarakoon
 
-FIXME: description
+This is a Clojure client for Arakoon, see https://github.com/Incubaid/arakoon .
+It uses netty and core.async.
+Note that it is incomplete and still changing wildly.
 
-## Installation
-
-Download from http://example.com/FIXME.
-
-## Usage
-
-FIXME: explanation
-
-    $ java -jar clarakoon-0.1.0-standalone.jar [args]
-
-## Options
-
-FIXME: listing of options this app accepts.
-
-## Examples
-
-...
-
-### Bugs
-
-...
-
-### Any Other Sections
-### That You Think
-### Might be Useful
-
-## License
-
-Copyright © 2013 FIXME
-
-Distributed under the Eclipse Public License, the same as Clojure.
+There is no documentation.
+There are no leining packages.
