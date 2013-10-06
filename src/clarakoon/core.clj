@@ -82,7 +82,7 @@
   (let [client (make-arakoon-client address cluster-id)]
     (c/send-command client :who-master)
     (println (<!! (:result-channel client)))
-    (c/send-command client :exists "key")
+    (c/send-command client :exists false "key")
     (println (<!! (:result-channel client)))
     (c/send-command client :set "key" "value")
     (println (<!! (:result-channel client)))
