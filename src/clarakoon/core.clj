@@ -1,5 +1,9 @@
 (ns clarakoon.core
-  (:require [clarakoon.codec :as c])
+  (:require [clojure.core.async
+             :as async
+             :refer [<! >! <!! >!! timeout chan alt! go close!]]
+            [clarakoon.codec
+             :as c])
   (:import [java.net
             InetSocketAddress]
            [java.nio
@@ -20,51 +24,57 @@
             HeapChannelBufferFactory]
            ))
 
-(require '[clojure.core.async :as async :refer [<! >! <!! >!! timeout chan alt! go]])
-
-(defn client-handler [cluster-id decode-with connected result-channel]
+(defn make-handler [connected decode-with result-channel]
   (proxy [ReplayingDecoder] []
-    (channelConnected [^ChannelHandlerContext ctx e]
-      (.write
-       (.getChannel ctx)
-       (c/prologue cluster-id))
-      (>!! connected 0))
+    (channelConnected [ctx e]
+      (close! connected))
     (decode [ctx channel buf state]
-      (let [return-code (.readInt buf)]
-        (case return-code
-          0
-          (do
-            (>!! result-channel (@decode-with buf))
-            0))))))
-;    #_(exceptionCaught [ctx cause]
-;        (.close ctx)))
+      (>!! result-channel (@decode-with buf)))))
 
-(defn bootstrap [cluster-id decode-with connected result-channel]
-  (doto
-      (ClientBootstrap.
-       (NioClientSocketChannelFactory.
-        (Executors/newCachedThreadPool)
-        (Executors/newCachedThreadPool)))
-    (.setOption "bufferFactory" (HeapChannelBufferFactory. ByteOrder/LITTLE_ENDIAN))
-    (.setPipelineFactory
-     (proxy [ChannelPipelineFactory] []
-       (getPipeline []
-         (doto (Channels/pipeline)
-           (.addLast "handler" (client-handler cluster-id decode-with connected result-channel))))))))
+(defn make-pipeline-factory [handler]
+  (proxy [ChannelPipelineFactory] []
+    (getPipeline []
+      (doto (Channels/pipeline)
+        (.addLast "handler" handler)))))
 
-(defn -main [& args]
+(defn make-channel
+  [socket-address cluster-id decode-with result-channel]
+  (let [bootstrap (ClientBootstrap.
+                   (NioClientSocketChannelFactory.
+                    (Executors/newCachedThreadPool)
+                    (Executors/newCachedThreadPool)))
+        connected (chan)
+        my-handler (make-handler connected decode-with result-channel)]
+    (doto bootstrap
+      (.setOption "bufferFactory"
+                  (HeapChannelBufferFactory. ByteOrder/LITTLE_ENDIAN))
+      (.setPipelineFactory (make-pipeline-factory my-handler)))
+    (let [future (.connect bootstrap socket-address)]
+      (<!! connected)
+      (.getChannel (.sync future)))))
+
+(defn make-arakoon-client [socket-address cluster-id]
   (let [decode-with (atom nil)
         result-channel (chan)
-        connected (chan)
-        bootstrap (bootstrap "ricky" decode-with connected result-channel)
-        future (.connect bootstrap (InetSocketAddress. "localhost" 4000))
-        channel (.getChannel (.sync future))]
-    (<!! connected)
-    (c/exists channel decode-with "key")
-    (println (<!! result-channel))
-    (c/set channel decode-with "key" "value")
-    (println (<!! result-channel))
-    (c/who-master channel decode-with)
-    (println (<!! result-channel))
+        channel (make-channel socket-address cluster-id decode-with result-channel)]
+    (.write channel (c/prologue cluster-id))
+    {:channel channel
+     :decode-with decode-with
+     :result-channel result-channel}))
+
+(def address
+  (InetSocketAddress. "localhost" 4000))
+(def cluster-id
+  "ricky")
+
+
+(defn -main [& args]
+  (let [client (make-arakoon-client address cluster-id)]
+    (c/send-command client :who-master)
+    (println (<!! (:result-channel client)))
+    (c/send-command client :exists "key")
+    (println (<!! (:result-channel client)))
+    (c/send-command client :set "key" "value")
+    (println (<!! (:result-channel client)))
     #_(.awaitUninterruptibly (.getCloseFuture channel))
-    (.releaseExternalResources bootstrap)))
+    #_(.releaseExternalResources bootstrap)))
