@@ -67,6 +67,16 @@
 (def cluster-id
   "ricky")
 
+; TODOS
+; - handle error return codes
+; - handle exceptions while decoding answers? exceptions and async? -> test, play
+; - handle other arakoon calls, but first rewrite codec/commands
+;   to something like
+;   {:who-master {:command 2
+;                 :args [[key string] [value string]]
+;                 :return-type [string option] }}
+; - write some integration tests, based on core/-main
+; - make 'cluster'-client a la what's available in python client
 
 (defn -main [& args]
   (let [client (make-arakoon-client address cluster-id)]
