@@ -2,6 +2,9 @@
   (:require [clojure.core.async
              :as async
              :refer [<! >! <!! >!! timeout chan alt! alts!! go close! thread]]
+            [clojure.core.match
+             :as match
+             :refer (match)]
             [clarakoon.codec
              :as c])
   (:import [java.net
@@ -87,9 +90,8 @@
                   (HeapChannelBufferFactory. ByteOrder/LITTLE_ENDIAN))
       (.setPipelineFactory (make-pipeline-factory handler)))))
 
-(defn make-node-client [cluster-id socket-address]
+(defn make-node-connection [cluster-id socket-address result-channel]
   (let [decode-with (atom nil)
-        result-channel (chan)
         event-channel (chan)
         handler (make-handler event-channel decode-with result-channel)
         bootstrap (make-bootstrap handler)
@@ -103,10 +105,40 @@
      :result-channel result-channel
      :event-channel event-channel}))
 
-(defn make-cluster-client [cluster-id nodes])
+(defn sync-command [connection command & args]
+  (apply c/send-command connection command args)
+  (<!! (:result-channel connection)))
 
-(def address
-  (InetSocketAddress. "localhost" 4000))
+(defn make-cluster-client [cluster-id nodes]
+  {:cluster-id cluster-id
+   :nodes nodes
+   :master (atom nil)
+   :connections (atom {})
+   :result-channel (chan)})
+
+(defn get-or-create-connection [client name]
+  (let [connection (@(:connections client) name)]
+    (if (or (nil? connection) false) ;; TODO check isConnected
+      (let [[ip port] ((:nodes client) name)
+            c (make-node-connection (:cluster-id client) (InetSocketAddress. ip port) (:result-channel client))]
+        (swap! (:connections client) (fn [cs] (assoc cs name c)))
+        c)
+      connection)))
+
+(defn determine-master [client]
+  (loop [[[name _] & rest] (shuffle (seq (:nodes client)))]
+    (let [connection (get-or-create-connection client name)
+          master (sync-command connection :who-master)]
+      (match master
+             [:none] (recur rest)
+             [:some m] (swap! (:master client) (fn [_] m))))))
+
+(defn send-command [client command & args]
+  (when (nil? @(:master client))
+    (determine-master client))
+  (let [conn (get-or-create-connection client @(:master client))]
+    (apply c/send-command conn command args)))
+
 (def nodes
   {"arakoon_0" ["127.0.0.1" 4000]
    "arakoon_1" ["127.0.0.1" 4001]
@@ -130,18 +162,18 @@
       )))
 
 (defn -main [& args]
-  (let [client (make-node-client cluster-id address)]
-    (c/send-command client :who-master)
+  (let [client (make-cluster-client cluster-id nodes)]
+    (send-command client :who-master)
     (println "who-master:" (get-result client))
-    (c/send-command client :exists false "key")
+    (send-command client :exists false "key")
     (println "exists:" (get-result client))
-    (c/send-command client :set "key" "thevalue")
+    (send-command client :set "key" "thevalue")
     (println "set:" (get-result client))
-    (c/send-command client :get false "key")
+    (send-command client :get false "key")
     (println "get:" (get-result client))
-    (c/send-command client :delete "key")
+    (send-command client :delete "key")
     (println "delete:" (get-result client))
-    (c/send-command client :exists false "key")
+    (send-command client :exists false "key")
     (println "exists:" (get-result client))
     #_(.awaitUninterruptibly (.getCloseFuture channel))
     #_(.releaseExternalResources bootstrap)))

@@ -121,9 +121,9 @@
                            0xff :unknown-failure)]
           (list error-code error-string))))))
 
-(defn send-command [client command & arguments]
+(defn send-command [connection command & arguments]
   (let [[code args return-type] (commands command)
         request-buffer (command-buffer code)]
     (write-args request-buffer args arguments)
-    (swap-decode (:decode-with client) (read-response return-type))
-    (.write (:channel client) request-buffer)))
+    (swap-decode (:decode-with connection) (read-response return-type))
+    (.write (:channel connection) request-buffer)))

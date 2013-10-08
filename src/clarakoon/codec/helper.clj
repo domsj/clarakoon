@@ -20,8 +20,8 @@
 (defn buf-read-option [buf read-value]
   (let [none-or-some-byte (.readByte buf)
         result            (case none-or-some-byte
-                            0x00 (list :none)
-                            0x01 (list :some (read-value buf)))]
+                            0x00 [:none]
+                            0x01 [:some (read-value buf)])]
     result))
 
 (defn buf-read-bool [buf]
