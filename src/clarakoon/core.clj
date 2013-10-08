@@ -1,7 +1,7 @@
 (ns clarakoon.core
   (:require [clojure.core.async
              :as async
-             :refer [<! >! <!! >!! timeout chan alt! go close!]]
+             :refer [<! >! <!! >!! timeout chan alt! alts!! go close! thread]]
             [clarakoon.codec
              :as c])
   (:import [java.net
@@ -24,12 +24,51 @@
             HeapChannelBufferFactory]
            ))
 
-(defn make-handler [connected decode-with result-channel]
+(defn make-handler [event-channel decode-with result-channel]
   (proxy [ReplayingDecoder] []
-    (channelConnected [ctx e]
-      (close! connected))
     (decode [ctx channel buf state]
-      (>!! result-channel (@decode-with buf)))))
+      (>!! result-channel (@decode-with buf)))
+    (channelBound [ctx e]
+      (thread (>!! event-channel :bound)))
+    (channelConnected [ctx e]
+      (thread (>!! event-channel :connected)))
+    (channelClosed [ctx e]
+      (>!! event-channel :closed))
+    (channelDisconnected [ctx e]
+      (>!! event-channel :disconnected))
+    (channelInterestChanged [ctx e]
+      (thread (>!! event-channel :interest-changed)))
+    (channelOpen [ctx e]
+      (thread (>!! event-channel :open)))
+    (channelUnbound [ctx e]
+      (>!! event-channel :unbound))))
+
+; cleanup [ctx e]
+;  channelDisconnected [ctx e]
+;  channelClosed [ctx e]
+
+; exceptionCaught [ctx e]
+
+; FrameDecoder
+;  actualReadableBytes
+;  messageReceived [ctx e]
+
+; SimpleChannelUpstreamHandler
+
+; channelBound(ChannelHandlerContext ctx, ChannelStateEvent e)
+; channelClosed(ChannelHandlerContext ctx, ChannelStateEvent e)
+; channelConnected(ChannelHandlerContext ctx, ChannelStateEvent e)
+; channelDisconnected(ChannelHandlerContext ctx, ChannelStateEvent e)
+; channelInterestChanged(ChannelHandlerContext ctx, ChannelStateEvent e)
+; channelOpen(ChannelHandlerContext ctx, ChannelStateEvent e)
+; channelUnbound(ChannelHandlerContext ctx, ChannelStateEvent e)
+; childChannelClosed(ChannelHandlerContext ctx, ChildChannelStateEvent e)
+; childChannelOpen(ChannelHandlerContext ctx, ChildChannelStateEvent e)
+; exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e)
+; handleUpstream(ChannelHandlerContext ctx, ChannelEvent e)
+; messageReceived(ChannelHandlerContext ctx, MessageEvent e)
+; writeComplete(ChannelHandlerContext ctx, WriteCompletionEvent e)
+
 
 (defn make-pipeline-factory [handler]
   (proxy [ChannelPipelineFactory] []
@@ -37,33 +76,41 @@
       (doto (Channels/pipeline)
         (.addLast "handler" handler)))))
 
-(defn make-channel
-  [socket-address cluster-id decode-with result-channel]
+(defn make-bootstrap
+  [handler]
   (let [bootstrap (ClientBootstrap.
                    (NioClientSocketChannelFactory.
                     (Executors/newCachedThreadPool)
-                    (Executors/newCachedThreadPool)))
-        connected (chan)
-        my-handler (make-handler connected decode-with result-channel)]
+                    (Executors/newCachedThreadPool)))]
     (doto bootstrap
       (.setOption "bufferFactory"
                   (HeapChannelBufferFactory. ByteOrder/LITTLE_ENDIAN))
-      (.setPipelineFactory (make-pipeline-factory my-handler)))
-    (let [future (.connect bootstrap socket-address)]
-      (<!! connected)
-      (.getChannel (.sync future)))))
+      (.setPipelineFactory (make-pipeline-factory handler)))))
 
-(defn make-arakoon-client [socket-address cluster-id]
+(defn make-node-client [cluster-id socket-address]
   (let [decode-with (atom nil)
         result-channel (chan)
-        channel (make-channel socket-address cluster-id decode-with result-channel)]
+        event-channel (chan)
+        handler (make-handler event-channel decode-with result-channel)
+        bootstrap (make-bootstrap handler)
+        channel (let [future (.connect bootstrap socket-address)]
+                  (<!! event-channel)
+                  (.getChannel (.sync future)))]
+    (<!! event-channel)
     (.write channel (c/prologue cluster-id))
     {:channel channel
      :decode-with decode-with
-     :result-channel result-channel}))
+     :result-channel result-channel
+     :event-channel event-channel}))
+
+(defn make-cluster-client [cluster-id nodes])
 
 (def address
   (InetSocketAddress. "localhost" 4000))
+(def nodes
+  {"arakoon_0" ["127.0.0.1" 4000]
+   "arakoon_1" ["127.0.0.1" 4001]
+   "arakoon_2" ["127.0.0.1" 4002]})
 (def cluster-id
   "ricky")
 
@@ -74,17 +121,27 @@
 ; - write some integration tests, based on core/-main
 ; - make 'cluster'-client a la what's available in python client
 
+(defn get-result [client]
+  (<!! (:result-channel client))
+  #_(let [disconnected (:event-channel client)
+        [v ch] (alts!! [disconnected (:result-channel client)])]
+    [v ch]
+    #_(if (= ch disconnected)
+      )))
+
 (defn -main [& args]
-  (let [client (make-arakoon-client address cluster-id)]
+  (let [client (make-node-client cluster-id address)]
     (c/send-command client :who-master)
-    (println (<!! (:result-channel client)))
+    (println "who-master:" (get-result client))
     (c/send-command client :exists false "key")
-    (println (<!! (:result-channel client)))
+    (println "exists:" (get-result client))
     (c/send-command client :set "key" "thevalue")
-    (println (<!! (:result-channel client)))
+    (println "set:" (get-result client))
     (c/send-command client :get false "key")
-    (println (<!! (:result-channel client)))
+    (println "get:" (get-result client))
     (c/send-command client :delete "key")
-    (println (<!! (:result-channel client)))
+    (println "delete:" (get-result client))
+    (c/send-command client :exists false "key")
+    (println "exists:" (get-result client))
     #_(.awaitUninterruptibly (.getCloseFuture channel))
     #_(.releaseExternalResources bootstrap)))

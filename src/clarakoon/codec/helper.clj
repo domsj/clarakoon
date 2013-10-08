@@ -66,7 +66,7 @@
   (.writeByte buf (if value 1 0)))
 
 (defn buf-write-string [buf ^String s]
-  (buf-write-int buf (.length s))
+  (buf-write-int32 buf (.length s))
   (.writeBytes buf (.getBytes s)))
 
 (defn buf-write-option [buf write-value value-option]
