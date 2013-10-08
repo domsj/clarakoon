@@ -8,6 +8,7 @@
             [clarakoon.codec
              :as c])
   (:import [java.net
+            ConnectException
             InetSocketAddress]
            [java.nio
             ByteOrder]
@@ -18,6 +19,8 @@
            [org.jboss.netty.channel
             ChannelPipelineFactory
             Channels
+            Channel
+            ChannelFuture
             ChannelHandlerContext]
            [org.jboss.netty.handler.codec.replay
             ReplayingDecoder]
@@ -26,6 +29,8 @@
            [org.jboss.netty.buffer
             HeapChannelBufferFactory]
            ))
+
+(set! *warn-on-reflection* true)
 
 (defn make-handler [event-channel decode-with result-channel]
   (proxy [ReplayingDecoder] []
@@ -95,19 +100,22 @@
         event-channel (chan)
         handler (make-handler event-channel decode-with result-channel)
         bootstrap (make-bootstrap handler)
-        channel (let [future (.connect bootstrap socket-address)]
-                  (<!! event-channel)
-                  (.getChannel (.sync future)))]
-    (<!! event-channel)
+        ^Channel channel (let [^ChannelFuture future (.connect bootstrap socket-address)]
+                  (loop [event (<!! event-channel)] ; loop until connected
+                    (case event
+                      :open (recur (<!! event-channel))
+                      :bound (recur (<!! event-channel))
+                      :connected (.getChannel future)
+                      (throw (ConnectException.))))
+                  )]
     (.write channel (c/prologue cluster-id))
     {:channel channel
      :decode-with decode-with
-     :result-channel result-channel
      :event-channel event-channel}))
 
-(defn sync-command [connection command & args]
+(defn sync-command [connection result-channel command & args]
   (apply c/send-command connection command args)
-  (<!! (:result-channel connection)))
+  (<!! result-channel))
 
 (defn make-cluster-client [cluster-id nodes]
   {:cluster-id cluster-id
@@ -118,8 +126,8 @@
 
 (defn get-or-create-connection [client name]
   (let [connection (@(:connections client) name)]
-    (if (or (nil? connection) false) ;; TODO check isConnected
-      (let [[ip port] ((:nodes client) name)
+    (if (or (nil? connection) false) ;; TODO check isConnected ?
+      (let [[^String ip ^int port] ((:nodes client) name)
             c (make-node-connection (:cluster-id client) (InetSocketAddress. ip port) (:result-channel client))]
         (swap! (:connections client) (fn [cs] (assoc cs name c)))
         c)
@@ -127,11 +135,15 @@
 
 (defn determine-master [client]
   (loop [[[name _] & rest] (shuffle (seq (:nodes client)))]
-    (let [connection (get-or-create-connection client name)
-          master (sync-command connection :who-master)]
-      (match master
-             [:none] (recur rest)
-             [:some m] (swap! (:master client) (fn [_] m))))))
+    (match
+     (try
+       (let [connection (get-or-create-connection client name)
+             master (sync-command connection (:result-channel client) :who-master)]
+         master)
+       (catch ConnectException e [:connection-failed]))
+     [:none] (throw (Exception. "Some text"))
+     [:connection-failed] (recur rest)
+     [:some m] (swap! (:master client) (fn [_] m)))))
 
 (defn send-command [client command & args]
   (when (nil? @(:master client))
