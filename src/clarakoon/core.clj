@@ -79,10 +79,10 @@
          handler (make-handler event-channel decode-with result-channel)
          bootstrap (make-bootstrap handler)
          ^ChannelFuture future (.connect bootstrap socket-address)
-         ^Channel channel (loop [event (async/<!! event-channel)] ; loop until connected
+         ^Channel channel (loop [event (<! event-channel)] ; loop until connected
                             (case event
-                              :open (recur (async/<!! event-channel))
-                              :bound (recur (async/<!! event-channel))
+                              :open (recur (<! event-channel))
+                              :bound (recur (<! event-channel))
                               :connected (.getChannel future)
                               nil))]
      (when channel
@@ -98,17 +98,31 @@
   (with-random-connections [this f]
     "method that provides connections until a non-nil value is returned from f"))
 
-(defrecord ClusterConnectionPool [cluster-id nodes]
+(defrecord ClusterConnectionPool [cluster-id nodes conns]
   ;; todo keep previous connections in private state
   ;; todo don't just shuffle but first connect to existing open connections, if any
   ConnectionPool
   (with-connection [this node-name f]
     (go
-     (let [[^String ip ^int port] (nodes node-name)
-           connection (<! (make-node-connection cluster-id (InetSocketAddress. ip port)))]
-       (when connection
-         (f connection)
-         (<! (:result-channel connection))))))
+     (when-let [connection (or
+                            (@conns node-name)
+                            (let [[^String ip ^int port] (nodes node-name)
+                                  conn (<! (make-node-connection cluster-id (InetSocketAddress. ip port)))]
+                              (go (loop [e (<! (:event-channel conn))]
+                                    (match e
+                                           nil (swap! conns assoc node-name nil)
+                                           (recur (<! (:event-channel conn))))))
+                              conn)
+                            )]
+       (swap! conns assoc node-name connection)
+       (try
+         (do
+           (f connection)
+           (<! (:result-channel connection)))
+         (catch Exception e (do
+                              (swap! conns assoc node-name nil)
+                              e)))
+       )))
   (with-random-connections [this f]
     (go
      (loop [[[node-name _] & rest] (shuffle (seq nodes))]
@@ -139,7 +153,7 @@
   "ricky")
 
 (def c-pool
-  (ClusterConnectionPool. cluster-id nodes))
+  (ClusterConnectionPool. cluster-id nodes (atom {})))
 
 ; TODOS
 ; - handle exceptions while decoding answers? exceptions and async? -> test, play
@@ -148,6 +162,8 @@
 ; - write some integration tests, based on core/-main
 ; - make 'cluster'-client a la what's available in python client
 ; - add core.typed
+; - clean up connections van connection pool ...
+
 
 (defn -main [& args]
   (go
