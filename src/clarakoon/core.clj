@@ -6,7 +6,9 @@
              :as match
              :refer (match)]
             [clarakoon.codec
-             :as c])
+             :as c]
+            [clj-time.core
+             :as time])
   (:import [java.net
             ConnectException
             InetSocketAddress]
@@ -41,41 +43,15 @@
     (channelConnected [ctx e]
       (thread (>!! event-channel :connected)))
     (channelClosed [ctx e]
-      (>!! event-channel :closed))
+      (close! event-channel))
     (channelDisconnected [ctx e]
-      (>!! event-channel :disconnected))
+      (close! event-channel))
     (channelInterestChanged [ctx e]
       (thread (>!! event-channel :interest-changed)))
     (channelOpen [ctx e]
       (thread (>!! event-channel :open)))
     (channelUnbound [ctx e]
-      (>!! event-channel :unbound))))
-
-; cleanup [ctx e]
-;  channelDisconnected [ctx e]
-;  channelClosed [ctx e]
-
-; exceptionCaught [ctx e]
-
-; FrameDecoder
-;  actualReadableBytes
-;  messageReceived [ctx e]
-
-; SimpleChannelUpstreamHandler
-
-; channelBound(ChannelHandlerContext ctx, ChannelStateEvent e)
-; channelClosed(ChannelHandlerContext ctx, ChannelStateEvent e)
-; channelConnected(ChannelHandlerContext ctx, ChannelStateEvent e)
-; channelDisconnected(ChannelHandlerContext ctx, ChannelStateEvent e)
-; channelInterestChanged(ChannelHandlerContext ctx, ChannelStateEvent e)
-; channelOpen(ChannelHandlerContext ctx, ChannelStateEvent e)
-; channelUnbound(ChannelHandlerContext ctx, ChannelStateEvent e)
-; childChannelClosed(ChannelHandlerContext ctx, ChildChannelStateEvent e)
-; childChannelOpen(ChannelHandlerContext ctx, ChildChannelStateEvent e)
-; exceptionCaught(ChannelHandlerContext ctx, ExceptionEvent e)
-; handleUpstream(ChannelHandlerContext ctx, ChannelEvent e)
-; messageReceived(ChannelHandlerContext ctx, MessageEvent e)
-; writeComplete(ChannelHandlerContext ctx, WriteCompletionEvent e)
+      (close! event-channel))))
 
 
 (defn make-pipeline-factory [handler]
@@ -101,55 +77,56 @@
         handler (make-handler event-channel decode-with result-channel)
         bootstrap (make-bootstrap handler)
         ^Channel channel (let [^ChannelFuture future (.connect bootstrap socket-address)]
-                  (loop [event (<!! event-channel)] ; loop until connected
-                    (case event
-                      :open (recur (<!! event-channel))
-                      :bound (recur (<!! event-channel))
-                      :connected (.getChannel future)
-                      (throw (ConnectException.))))
-                  )]
-    (.write channel (c/prologue cluster-id))
-    {:channel channel
-     :decode-with decode-with
-     :event-channel event-channel}))
+                           (loop [event (<!! event-channel)] ; loop until connected
+                             (case event
+                               :open (recur (<!! event-channel))
+                               :bound (recur (<!! event-channel))
+                               :connected (.getChannel future)
+                               nil))
+                           )]
+    (when channel
+      (.write channel (c/prologue cluster-id))
+      {:channel channel
+       :decode-with decode-with
+       :event-channel event-channel})))
 
-(defn sync-command [connection result-channel command & args]
-  (apply c/send-command connection command args)
-  (<!! result-channel))
+(defprotocol ConnectionPool
+  (with-connection [this node-name f]
+    "method that provides a connection to the specified node
+     returns the result from or nil when a ConectException occured")
+  (with-random-connections [this f] "method that provides connections until a non-nil value is returned from f"))
 
-(defn make-cluster-client [cluster-id nodes]
-  {:cluster-id cluster-id
-   :nodes nodes
-   :master (atom nil)
-   :connections (atom {})
-   :result-channel (chan)})
+(defrecord ClusterConnectionPool [cluster-id nodes]
+  ;; todo keep previous connections in private state
+  ;; todo don't just shuffle but first connect to existing open connections, if any
+  ConnectionPool
+  (with-connection [this node-name f]
+    (let [[^String ip ^int port] (nodes node-name)
+          result-channel (chan)
+          connection (make-node-connection cluster-id (InetSocketAddress. ip port) result-channel)]
+      (when connection
+        (f connection)
+        result-channel)))
+  (with-random-connections [this f]
+    (loop [[[node-name _] & rest] (shuffle (seq nodes))]
+      (if-let [result (with-connection this node-name f)]
+        result
+        (recur rest)))))
 
-(defn get-or-create-connection [client name]
-  (let [connection (@(:connections client) name)]
-    (if (or (nil? connection) false) ;; TODO check isConnected ?
-      (let [[^String ip ^int port] ((:nodes client) name)
-            c (make-node-connection (:cluster-id client) (InetSocketAddress. ip port) (:result-channel client))]
-        (swap! (:connections client) (fn [cs] (assoc cs name c)))
-        c)
-      connection)))
+(defn with-client [c-pool command & args]
+  (with-random-connections c-pool #(apply c/send-command % command args)))
 
-(defn determine-master [client]
-  (loop [[[name _] & rest] (shuffle (seq (:nodes client)))]
-    (match
-     (try
-       (let [connection (get-or-create-connection client name)
-             master (sync-command connection (:result-channel client) :who-master)]
-         master)
-       (catch ConnectException e [:connection-failed]))
-     [:none] (throw (Exception. "Some text"))
-     [:connection-failed] (recur rest)
-     [:some m] (swap! (:master client) (fn [_] m)))))
+(defn find-master [c-pool]
+  (with-client c-pool :who-master))
 
-(defn send-command [client command & args]
-  (when (nil? @(:master client))
-    (determine-master client))
-  (let [conn (get-or-create-connection client @(:master client))]
-    (apply c/send-command conn command args)))
+(defn with-node-client [c-pool node-name command & args]
+  (with-connection c-pool node-name #(apply c/send-command % command args)))
+
+(defn with-master-client [c-pool command & args]
+  (go
+   (match (<! (find-master c-pool))
+          [:none] nil
+          [:some m] (<! (apply with-node-client c-pool m command args)))))
 
 (def nodes
   {"arakoon_0" ["127.0.0.1" 4000]
@@ -164,28 +141,14 @@
 ; - handle other arakoon calls
 ; - write some integration tests, based on core/-main
 ; - make 'cluster'-client a la what's available in python client
-
-(defn get-result [client]
-  (<!! (:result-channel client))
-  #_(let [disconnected (:event-channel client)
-        [v ch] (alts!! [disconnected (:result-channel client)])]
-    [v ch]
-    #_(if (= ch disconnected)
-      )))
+; - add core.typed
 
 (defn -main [& args]
-  (let [client (make-cluster-client cluster-id nodes)]
-    (send-command client :who-master)
-    (println "who-master:" (get-result client))
-    (send-command client :exists false "key")
-    (println "exists:" (get-result client))
-    (send-command client :set "key" "thevalue")
-    (println "set:" (get-result client))
-    (send-command client :get false "key")
-    (println "get:" (get-result client))
-    (send-command client :delete "key")
-    (println "delete:" (get-result client))
-    (send-command client :exists false "key")
-    (println "exists:" (get-result client))
-    #_(.awaitUninterruptibly (.getCloseFuture channel))
-    #_(.releaseExternalResources bootstrap)))
+  (let [c-pool (ClusterConnectionPool. cluster-id nodes)]
+    (println (<!! (find-master c-pool)))
+    (println (<!! (with-client c-pool :who-master)))
+    (println (<!! (with-master-client c-pool :set "key" "avalue")))
+    (println (<!! (with-master-client c-pool :get false "key")))
+    (println (<!! (with-master-client c-pool :exists false "key")))
+    (println (<!! (with-master-client c-pool :delete "key")))
+    (println (<!! (with-master-client c-pool :exists false "key")))))

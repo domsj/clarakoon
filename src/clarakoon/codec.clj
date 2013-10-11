@@ -119,7 +119,7 @@
                            6 :wrong-cluster
                            7 :assertion-failed
                            0xff :unknown-failure)]
-          (list error-code error-string))))))
+          [error-code error-string])))))
 
 (defn send-command [connection command & arguments]
   (let [[code args return-type] (commands command)
