@@ -128,7 +128,8 @@
      (loop [[[node-name _] & rest] (shuffle (seq nodes))]
        (if-let [result (<! (with-connection this node-name f))]
          result
-         (recur rest))))))
+         (if-not (nil? rest)
+           (recur rest)))))))
 
 (defn with-client [c-pool command & args]
   (with-random-connections c-pool #(apply c/send-command % command args)))
@@ -144,6 +145,35 @@
    (match (<! (find-master c-pool))
           [:none] nil
           [:some m] (<! (apply with-node-client c-pool m command args)))))
+
+(defn with-retrying-master-client
+  [c-pool {:keys [retry-period back-off] :or {retry-period 60 back-off 200}} command & args]
+  (let [start (System/currentTimeMillis)
+        until (+ start (* 1000 retry-period))]
+    (go
+     (let [do-request #(apply with-master-client c-pool command args)]
+       (loop [result (<! (do-request))
+              sleep-time back-off]
+         (match result
+                nil (do
+                      (let [now (System/currentTimeMillis)
+                            new-sleep-time (+ sleep-time back-off)
+                            til (+ now new-sleep-time)]
+                        (if (< til until)
+                          (do
+                            (<! (timeout sleep-time))
+                            (recur (<! (do-request)) new-sleep-time))
+                          :time-out)))
+                [:not-master _] (do
+                                  (let [now (System/currentTimeMillis)
+                                        new-sleep-time (+ sleep-time back-off)
+                                        til (+ now new-sleep-time)]
+                                    (if (< til until)
+                                      (do
+                                        (<! (timeout sleep-time))
+                                        (recur (<! (do-request)) new-sleep-time))
+                                      :time-out)))
+                x x))))))
 
 (def nodes
   {"arakoon_0" ["127.0.0.1" 4000]
@@ -166,11 +196,12 @@
 
 
 (defn -main [& args]
-  (go
-   (println (<! (find-master c-pool)))
-   (println (<! (with-client c-pool :who-master)))
-   (println (<! (with-master-client c-pool :set "key" "avalue")))
-   (println (<! (with-master-client c-pool :get false "key")))
-   (println (<! (with-master-client c-pool :exists false "key")))
-   (println (<! (with-master-client c-pool :delete "key")))
-   (println (<! (with-master-client c-pool :exists false "key")))))
+  (async/<!!
+   (go
+    (println (<! (find-master c-pool)))
+    (println (<! (with-client c-pool :who-master)))
+    (println (<! (with-retrying-master-client c-pool {} :set "key" "avalue")))
+    (println (<! (with-retrying-master-client c-pool {} :get false "key")))
+    (println (<! (with-retrying-master-client c-pool {} :exists false "key")))
+    (println (<! (with-retrying-master-client c-pool {} :delete "key")))
+    (println (<! (with-retrying-master-client c-pool {} :exists false "key"))))))
