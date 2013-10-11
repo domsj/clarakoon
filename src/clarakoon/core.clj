@@ -6,9 +6,7 @@
              :as match
              :refer (match)]
             [clarakoon.codec
-             :as c]
-            [clj-time.core
-             :as time])
+             :as c])
   (:import [java.net
             ConnectException
             InetSocketAddress]
@@ -31,8 +29,6 @@
            [org.jboss.netty.buffer
             HeapChannelBufferFactory]
            ))
-
-(set! *warn-on-reflection* true)
 
 (defn make-handler [event-channel decode-with result-channel]
   (proxy [ReplayingDecoder] []
@@ -71,15 +67,16 @@
                   (HeapChannelBufferFactory. ByteOrder/LITTLE_ENDIAN))
       (.setPipelineFactory (make-pipeline-factory handler)))))
 
-(defn make-node-connection [cluster-id socket-address]
+(defn make-node-connection [cluster-id ^InetSocketAddress socket-address]
   (go
    (let [decode-with (atom nil)
          event-channel (chan)
          result-channel (chan)
          handler (make-handler event-channel decode-with result-channel)
-         bootstrap (make-bootstrap handler)
+         ^ClientBootstrap bootstrap (make-bootstrap handler)
          ^ChannelFuture future (.connect bootstrap socket-address)
-         ^Channel channel (loop [event (<! event-channel)] ; loop until connected
+         ^Channel channel (loop [event (<! event-channel)]
+                            ;; loop until connected
                             (case event
                               :open (recur (<! event-channel))
                               :bound (recur (<! event-channel))
@@ -94,13 +91,11 @@
 
 (defprotocol ConnectionPool
   (with-connection [this node-name f]
-    "method that provides a connection to the specified node returns the result from")
+    "method that provides a connection to the specified node returns the result from f or nil if the node can't be reached")
   (with-random-connections [this f]
-    "method that provides connections until a non-nil value is returned from f"))
+    "method that provides connections until a non-nil value is returned from f, or it runs out of possible nodes to connect with"))
 
 (defrecord ClusterConnectionPool [cluster-id nodes conns]
-  ;; todo keep previous connections in private state
-  ;; todo don't just shuffle but first connect to existing open connections, if any
   ConnectionPool
   (with-connection [this node-name f]
     (go
@@ -108,10 +103,11 @@
                             (@conns node-name)
                             (let [[^String ip ^int port] (nodes node-name)
                                   conn (<! (make-node-connection cluster-id (InetSocketAddress. ip port)))]
-                              (go (loop [e (<! (:event-channel conn))]
-                                    (match e
-                                           nil (swap! conns assoc node-name nil)
-                                           (recur (<! (:event-channel conn))))))
+                              (if-not (nil? conn)
+                                (go (loop [e (<! (:event-channel conn))]
+                                      (match e
+                                             nil (swap! conns assoc node-name nil)
+                                             (recur (<! (:event-channel conn)))))))
                               conn)
                             )]
        (swap! conns assoc node-name connection)
@@ -125,11 +121,15 @@
        )))
   (with-random-connections [this f]
     (go
+     ;; todo don't just shuffle but first connect to existing open connections, if any
      (loop [[[node-name _] & rest] (shuffle (seq nodes))]
        (if-let [result (<! (with-connection this node-name f))]
          result
          (if-not (nil? rest)
            (recur rest)))))))
+
+(defn make-connection-pool [cluster-id nodes]
+  (ClusterConnectionPool. cluster-id nodes (atom {})))
 
 (defn with-client [c-pool command & args]
   (with-random-connections c-pool #(apply c/send-command % command args)))
@@ -175,33 +175,12 @@
                                       :time-out)))
                 x x))))))
 
-(def nodes
-  {"arakoon_0" ["127.0.0.1" 4000]
-   "arakoon_1" ["127.0.0.1" 4001]
-   "arakoon_2" ["127.0.0.1" 4002]})
-(def cluster-id
-  "ricky")
-
-(def c-pool
-  (ClusterConnectionPool. cluster-id nodes (atom {})))
 
 ; TODOS
 ; - handle exceptions while decoding answers? exceptions and async? -> test, play
 ; - handle sequences
 ; - handle other arakoon calls
 ; - write some integration tests, based on core/-main
-; - make 'cluster'-client a la what's available in python client
 ; - add core.typed
 ; - clean up connections van connection pool ...
-
-
-(defn -main [& args]
-  (async/<!!
-   (go
-    (println (<! (find-master c-pool)))
-    (println (<! (with-client c-pool :who-master)))
-    (println (<! (with-retrying-master-client c-pool {} :set "key" "avalue")))
-    (println (<! (with-retrying-master-client c-pool {} :get false "key")))
-    (println (<! (with-retrying-master-client c-pool {} :exists false "key")))
-    (println (<! (with-retrying-master-client c-pool {} :delete "key")))
-    (println (<! (with-retrying-master-client c-pool {} :exists false "key"))))))
+; - publish on clojars
