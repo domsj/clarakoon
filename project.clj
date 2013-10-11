@@ -7,5 +7,6 @@
                  [org.clojure/core.match "0.2.0"]
                  [io.netty/netty "3.7.0.Final"]
                  [clj-time "0.6.0"]
+                 [org.clojure/core.typed "0.2.13"]
                  [org.clojure/core.async "0.1.242.0-44b1e3-alpha"]]
   :main clarakoon.core)
